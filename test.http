@@ -1,0 +1,6 @@
+POST 127.0.0.1:8000/auth/mobile/
+Content-Type: application/json
+{
+mobile: "+8613809073869"
+}
+###。
