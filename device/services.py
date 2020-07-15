@@ -1,10 +1,9 @@
-from intellikeeper_api.aliyun_settings import AliyunSettings
+import base64
+import json
+
+from aliyunsdkcore.acs_exception.exceptions import ServerException
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
-from aliyunsdkcore.acs_exception.exceptions import ServerException
-
-import json
-import base64
 
 
 def call_device(uid, action, params=None):
@@ -44,8 +43,3 @@ def call_device(uid, action, params=None):
         return None
 
 
-def handshake_with(uid):
-    response = call_device(uid, 'handshake')
-    if response is None:
-        return False
-    return 'status' in response and response['status'] == 'hello'

@@ -1,21 +1,38 @@
-import json
-
+from django_filters import rest_framework as drf_filter
+from huaweicloudsdkcore.exceptions.exceptions import ServerResponseException
+from huaweicloudsdkiotda.v5 import ListPropertiesRequest
 from rest_framework import viewsets, permissions, status, views
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
+from device.iot import get_iot_client, tag_sync_conf, get_readers
 from device.models import Device
-from tag.serializers import TagSerializer, TriggerSerializer
-from tag.models import Tag, Callback, Trigger
 from device.services import call_device
-from tag.apps import TagConfig
-from tag.services import handle_callbacks, invoke_trigger
+from intellikeeper_api.hwyun_settings import HwyunSettings
+from tag.models import Tag, Callback, Trigger, TagCategory, Reader, Event
+from tag.serializers import TagSerializer, TriggerSerializer, TagCategorySerializer, ReaderSerializer, \
+    ClassifiedTagCategorySerializer, TrackedTagSerializer, EventSerializer
+from tag.services import invoke_trigger, tag_get_sub_categories, run_callbacks
+
+
+class TagFilter(drf_filter.FilterSet):
+    category = drf_filter.NumberFilter(method='filter_category')
+
+    def filter_category(self, queryset, name, value):
+        try:
+            category = TagCategory.objects.get(pk=value)
+        except TagCategory.DoesNotExist:
+            return queryset
+        return queryset.filter(category__in=tag_get_sub_categories(category))
 
 
 class TagViewset(viewsets.ModelViewSet):
     permission_classes = (permissions.IsAuthenticated,)
     serializer_class = TagSerializer
+
+    filter_backends = (drf_filter.DjangoFilterBackend, )
+    filterset_class = TagFilter
 
     def get_queryset(self):
         if 'device' not in self.request.query_params:
@@ -33,14 +50,57 @@ class TagViewset(viewsets.ModelViewSet):
             'request': self.request
         }
 
-    def perform_create(self, serializer):
-        new_tag_id = call_device(Device.objects.get(pk=self.request.data['device']).uid, 'new_tag')
-        if new_tag_id['new_tag_tid'] is None:
-            raise ValidationError({
-                'tid': ['无法识别到标签，请将标签靠近基站再试。']
-            })
+    def perform_update(self, serializer: TagSerializer):
+        tag_sync_conf(serializer.save())
 
-        serializer.save(tid=new_tag_id['new_tag_tid'])
+
+class ReaderViewset(viewsets.ModelViewSet):
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = ReaderSerializer
+
+    def get_queryset(self):
+        if 'device' not in self.request.query_params:
+            raise ValidationError
+
+        device_id = self.request.query_params['device']
+        try:
+            device = Device.objects.get(pk=device_id, belongs_to=self.request.user)
+            return Reader.objects.filter(device=device)
+        except Device.DoesNotExist:
+            raise ValidationError
+
+    def list(self, request, *args, **kwargs):
+        device_id = self.request.query_params['device']
+        try:
+            device = Device.objects.get(pk=device_id, belongs_to=self.request.user)
+        except Device.DoesNotExist:
+            raise ValidationError
+
+        # 先同步readers
+        get_readers(device)
+
+        return super().list(request, *args, **kwargs)
+
+    def get_serializer_context(self):
+        return {
+            'request': self.request
+        }
+
+
+@api_view(('GET', ))
+@permission_classes((permissions.IsAuthenticated, ))
+def checkout_tags(request):
+    try:
+        device = Device.objects.get(pk=request.query_params.get('device'), belongs_to=request.user)
+    except Device.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # get all tags
+    try:
+        client = get_iot_client()
+        return client.list_properties(ListPropertiesRequest(device.device_id, service_id=HwyunSettings.service_id))
+    except ServerResponseException as e:
+        print(e.error_msg)
 
 
 @api_view(('GET',))
@@ -66,58 +126,23 @@ def change_tag_status(request, pk):
         return Response(status=status.HTTP_400_BAD_REQUEST)
 
     new_is_active = request.data.get('new_status', 'false') == 'true'
-    res = call_device(tag.device.uid, 'activate_tag' if new_is_active else 'deactivate_tag', {
-        'tid': tag.tid
-    })
-
-    if res is None or 'success' not in res:
-        return Response({
-            'success': False
-        })
-
     tag.is_active = True if new_is_active else False
     tag.save()
+    tag_sync_conf(tag)
 
     return Response({
         'success': True
     })
 
 
-@api_view(('POST',))
-def dead_tags(request):
-    key = request.data.get('key', None)
-    base_id = request.data.get('base_id', None)
-    print(request.data.get('dead_tags', '[]'))
-    dead_tags_list = json.loads(request.data.get('dead_tags', '[]'))
+@api_view(('GET', ))
+def test_callback(request, pk):
+    try:
+        tag = Tag.objects.get(pk=pk, device__belongs_to=request.user)
+    except Tag.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
 
-    if key != TagConfig.key_dead_tags:
-        return Response(status=status.HTTP_403_FORBIDDEN)
-
-    for tid in dead_tags_list:
-        try:
-            tag = Tag.objects.get(tid=tid)
-            if tag.device.uid != base_id:
-                continue
-
-            if not tag.is_active:
-                continue
-
-            # First, run GLOBAL triggers
-            uid = tag.device.belongs_to.id
-            callbacks = Callback.objects.filter(scope=1, target=uid).all()
-            handle_callbacks(callbacks, request, tag)
-
-            # Then, run BASE-LEVEL triggers
-            callbacks = Callback.objects.filter(scope=2, target=tag.device.id).all()
-            handle_callbacks(callbacks, request, tag)
-
-            # Then, run TAG-LEVEL triggers
-            callbacks = Callback.objects.filter(scope=3, target=tag.id).all()
-            handle_callbacks(callbacks, request, tag)
-
-        except Tag.DoesNotExist:
-            continue
-
+    run_callbacks(tag, 'test')
     return Response()
 
 
@@ -173,16 +198,13 @@ def test_trigger(request, pk):
     except Trigger.DoesNotExist:
         return Response(status=status.HTTP_400_BAD_REQUEST)
 
-    invoke_trigger(trigger, {
-        'tag': tag,
-        'request': request
-    })
+    invoke_trigger(trigger, tag, 'test')
 
     return Response()
 
 
 class CallbackView(views.APIView):
-    permission_classes = (permissions.IsAuthenticated, )
+    permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request):
         scope = int(request.query_params.get('scope', 1))
@@ -206,14 +228,26 @@ class CallbackView(views.APIView):
                                                                                                   flat=True)
             return Response(Trigger.objects.filter(id__in=callback_trigger_ids).values('id', 'name'))
 
-        # 标签的触发器
+        # 分类触发器
         if scope == 3:
+            try:
+                category = TagCategory.objects.get(pk=target, device__belongs_to=request.user)
+            except Device.DoesNotExist:
+                return Response(status=status.HTTP_400_BAD_REQUEST)
+
+            callback_trigger_ids = Callback.objects.filter(scope=3, target=category.id,
+                                                           trigger__belongs_to=request.user).values_list('trigger_id',
+                                                                                                         flat=True)
+            return Response(Trigger.objects.filter(id__in=callback_trigger_ids).values('id', 'name'))
+
+        # 标签的触发器
+        if scope == 4:
             try:
                 tag = Tag.objects.get(pk=target, device__belongs_to=request.user)
             except Tag.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
 
-            callback_trigger_ids = Callback.objects.filter(scope=3, target=tag.id).values_list('trigger_id', flat=True)
+            callback_trigger_ids = Callback.objects.filter(scope=4, target=tag.id).values_list('trigger_id', flat=True)
             return Response(Trigger.objects.filter(id__in=callback_trigger_ids).values('id', 'name'))
 
         return Response(status=status.HTTP_400_BAD_REQUEST)
@@ -244,14 +278,24 @@ class CallbackView(views.APIView):
             Callback.objects.create(scope=2, target=device.id, trigger=trigger)
             return Response()
 
-        # 标签的触发器
+        # 分类级触发器
         if scope == 3:
+            try:
+                category = TagCategory.objects.get(pk=target, device__belongs_to=request.user)
+            except Device.DoesNotExist:
+                return Response(status=status.HTTP_400_BAD_REQUEST)
+
+            Callback.objects.create(scope=3, target=category.id, trigger=trigger)
+            return Response()
+
+        # 标签的触发器
+        if scope == 4:
             try:
                 tag = Tag.objects.get(pk=target, device__belongs_to=request.user)
             except Tag.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
 
-            Callback.objects.create(scope=3, target=tag.id, trigger=trigger)
+            Callback.objects.create(scope=4, target=tag.id, trigger=trigger)
             return Response()
 
         return Response(status=status.HTTP_400_BAD_REQUEST)
@@ -272,7 +316,7 @@ class CallbackView(views.APIView):
             try:
                 o = Callback.objects.get(scope=1, target=request.user.id, trigger=trigger)
                 o.delete()
-            except Trigger.DoesNotExist:
+            except Callback.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
             return Response()
 
@@ -286,21 +330,35 @@ class CallbackView(views.APIView):
             try:
                 o = Callback.objects.get(scope=2, target=device.id, trigger=trigger)
                 o.delete()
-            except Trigger.DoesNotExist:
+            except Callback.DoesNotExist:
+                return Response(status=status.HTTP_400_BAD_REQUEST)
+            return Response()
+
+        # 分类的触发器
+        if scope == 3:
+            try:
+                category = TagCategory.objects.get(pk=target, device__belongs_to=request.user)
+            except TagCategory.DoesNotExist:
+                return Response(status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                o = Callback.objects.get(scope=3, target=category.id, trigger=trigger)
+                o.delete()
+            except Callback.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
             return Response()
 
         # 标签的触发器
-        if scope == 3:
+        if scope == 4:
             try:
                 tag = Tag.objects.get(pk=target, device__belongs_to=request.user)
             except Tag.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
 
             try:
-                o = Callback.objects.get(scope=3, target=tag.id, trigger=trigger)
+                o = Callback.objects.get(scope=4, target=tag.id, trigger=trigger)
                 o.delete()
-            except Trigger.DoesNotExist:
+            except Callback.DoesNotExist:
                 return Response(status=status.HTTP_400_BAD_REQUEST)
             return Response()
 
@@ -339,33 +397,71 @@ def get_tags_info(request):
     return Response(result)
 
 
+class TagCategoryViewset(viewsets.ModelViewSet):
+    permission_classes = (permissions.IsAuthenticated,)
+    serializer_class = TagCategorySerializer
+
+    def get_queryset(self):
+        if 'device' not in self.request.query_params:
+            raise ValidationError
+
+        device_id = self.request.query_params['device']
+        try:
+            device = Device.objects.get(pk=device_id, belongs_to=self.request.user)
+            return TagCategory.objects.filter(device=device)
+        except Device.DoesNotExist:
+            raise ValidationError
+
+
 @api_view(('GET', ))
 @permission_classes((permissions.IsAuthenticated, ))
-def get_readers_pos(request):
+def get_classified_tags(request):
+    try:
+        device = Device.objects.get(pk=request.query_params.get('device'), belongs_to=request.user)
+        qs = TagCategory.objects.filter(device=device)
+    except Device.DoesNotExist:
+        qs = TagCategory.objects.filter(device__belongs_to=request.user)
+
+    return Response(ClassifiedTagCategorySerializer(qs, many=True).data)
+
+
+@api_view(('GET', ))
+@permission_classes((permissions.IsAuthenticated, ))
+def get_track(request):
     try:
         device = Device.objects.get(pk=request.query_params.get('device'), belongs_to=request.user)
     except Device.DoesNotExist:
         return Response(status=status.HTTP_400_BAD_REQUEST)
 
-    result = call_device(device.uid, 'get_readers_pos')
-    if result is None:
-        return Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    return Response(result)
+    return Response(TrackedTagSerializer(
+        TagFilter(request.GET, queryset=Tag.objects.filter(device=device)).qs,
+        many=True
+    ).data)
 
 
 @api_view(('GET', ))
 @permission_classes((permissions.IsAuthenticated, ))
-def get_track(request, pk):
+def get_events(request):
     try:
-        tag = Tag.objects.get(pk=pk, device__belongs_to=request.user)
-    except Tag.DoesNotExist:
+        device = Device.objects.get(pk=request.query_params.get('device'), belongs_to=request.user)
+    except Device.DoesNotExist:
         return Response(status=status.HTTP_400_BAD_REQUEST)
 
-    result = call_device(tag.device.uid, 'get_track', {
-        'tid': tag.tid
-    })
-    if result is None:
-        return Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    return Response(EventSerializer(
+        Event.objects.filter(tag__device=device),
+        many=True
+    ).data)
 
-    return Response(result)
+
+@api_view(('GET', ))
+@permission_classes((permissions.IsAuthenticated, ))
+def get_events_top10(request):
+    try:
+        device = Device.objects.get(pk=request.query_params.get('device'), belongs_to=request.user)
+    except Device.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(EventSerializer(
+        Event.objects.filter(tag__device=device)[:10],
+        many=True
+    ).data)
